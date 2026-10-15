@@ -1,0 +1,212 @@
+// Website Change Detector - database schema (PostgreSQL via Prisma)
+//
+// Key idea: fetching is de-duplicated through `Resource`.
+//   * A Resource is one (normalized URL, selector profile) pair.
+//   * Many users' `TrackedUrl` rows point at the same Resource.
+//   * The scheduler enqueues ONE check per Resource, snapshots belong to the
+//     Resource, and fan-out to users happens only at alert time.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum CheckStatus {
+  PENDING
+  OK
+  ERROR     // outage, 5xx, timeout, DNS failure
+  NOT_FOUND // 404 / 410
+  BLOCKED   // CAPTCHA, bot wall, 403, 429
+}
+
+enum Sensitivity {
+  LOW    // only large edits (>= 15% of words changed)
+  MEDIUM // default (>= 3%)
+  HIGH   // any change that survives noise filtering
+}
+
+enum AlertMode {
+  INSTANT
+  DAILY_DIGEST
+}
+
+enum AlertEventState {
+  PENDING
+  SENT
+  SUPPRESSED // dedupe, volatile page, keyword filter, or sensitivity threshold
+  FAILED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  apiToken     String   @unique @default(cuid()) // used by the browser extension
+  timezone     String   @default("UTC")
+  createdAt    DateTime @default(now())
+
+  trackedUrls   TrackedUrl[]
+  alertSettings AlertSettings?
+}
+
+/// A user's subscription to a page.
+model TrackedUrl {
+  id              String      @id @default(cuid())
+  userId          String
+  resourceId      String
+  name            String
+  url             String // exactly what the user entered
+  intervalMinutes Int         @default(60) // 15..1440, validated in API
+  sensitivity     Sensitivity @default(MEDIUM)
+  paused          Boolean     @default(false)
+
+  // Region selection (saved by the visual picker)
+  watchSelectors  String[] // if non-empty, ONLY these regions are compared
+  ignoreSelectors String[] // regions removed before comparison
+
+  // Bonus: keyword alerts. Empty = alert on any meaningful change.
+  keywordsAdded   String[] // notify only if one of these appears
+  keywordsRemoved String[] // notify only if one of these disappears
+
+  // Bonus: number tracking. e.g. [{"label":"Price","selector":".price","regex":null}]
+  numberRules Json?
+
+  // Per-user view of state (derived from the shared Resource)
+  lastNotifiedSnapshotId String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  resource Resource @relation(fields: [resourceId], references: [id])
+  alerts   AlertEvent[]
+
+  // The Resource already encodes (normalized URL + selector profile)
+  @@unique([userId, resourceId])
+  @@index([resourceId])
+  @@index([userId])
+}
+
+/// The unit of fetching. One row = one page + one selector profile.
+model Resource {
+  id             String      @id @default(cuid())
+  normalizedUrl  String
+  domain         String
+  profileHash    String // sha256 of sorted watch+ignore selectors ("" profile = whole page)
+  watchSelectors  String[]
+  ignoreSelectors String[]
+
+  // Effective interval = minimum interval of all active subscribers (see scheduler)
+  intervalMinutes Int      @default(60)
+  nextCheckAt     DateTime @default(now())
+
+  status             CheckStatus @default(PENDING)
+  statusDetail       String?
+  consecutiveErrors  Int         @default(0)
+  lastCheckedAt      DateTime?
+  lastChangedAt      DateTime?
+  lastHttpStatus     Int?
+
+  // Alert-fatigue guard
+  volatile        Boolean   @default(false)
+  volatileSince   DateTime?
+  recentChangeLog DateTime[] // timestamps of recent snapshot creations (pruned in code)
+
+  // Latest known good extraction, used for fast comparison without a join
+  latestSnapshotId String?
+
+  createdAt DateTime @default(now())
+
+  snapshots   Snapshot[]
+  subscribers TrackedUrl[]
+  numberPoints NumberPoint[]
+
+  @@unique([normalizedUrl, profileHash])
+  @@index([nextCheckAt])
+  @@index([domain])
+}
+
+/// Stored ONLY when the content hash changed.
+model Snapshot {
+  id         String   @id @default(cuid())
+  resourceId String
+  version    Int // 1, 2, 3 ... per resource
+  contentHash String // hash of NORMALIZED text (after noise filtering)
+  rawHash     String // hash of unfiltered text, for debugging noise
+  text        String // normalized text used for diffing
+  textBytes   Int
+  screenshotPath String? // relative to ARTIFACT_DIR
+  httpStatus  Int?
+  title       String?
+  createdAt   DateTime @default(now())
+
+  resource Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+
+  // Diff of this version against the previous one, cached after first compute.
+  diffFromPrev      Json?
+  screenshotDiffPath String?
+  changeRatio       Float? // 0..1 fraction of words changed
+  aiSummary         String?
+
+  alerts AlertEvent[]
+
+  @@unique([resourceId, version])
+  // NOT unique: a page may legitimately revert to earlier content (A -> B -> A)
+  @@index([resourceId, contentHash])
+  @@index([resourceId, createdAt])
+}
+
+model NumberPoint {
+  id         String   @id @default(cuid())
+  resourceId String
+  label      String
+  value      Float
+  rawText    String?
+  capturedAt DateTime @default(now())
+
+  resource Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+
+  @@index([resourceId, label, capturedAt])
+}
+
+model AlertSettings {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  mode        AlertMode @default(INSTANT)
+  digestHour  Int       @default(8) // local hour (0-23) in user's timezone
+  // Minimum minutes between two alerts for the same page (cooldown)
+  cooldownMinutes Int   @default(60)
+
+  emailEnabled    Boolean @default(true)
+  telegramBotToken String?
+  telegramChatId   String?
+  discordWebhookUrl String?
+  genericWebhookUrl String?
+  aiSummaries     Boolean @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// One row per (subscription, snapshot) notification decision. Doubles as
+/// the dedupe ledger and as the queue for the daily digest.
+model AlertEvent {
+  id           String          @id @default(cuid())
+  trackedUrlId String
+  snapshotId   String
+  dedupeKey    String // sha256(trackedUrlId + snapshot.contentHash)
+  state        AlertEventState @default(PENDING)
+  reason       String? // why suppressed / failed
+  summary      String?
+  createdAt    DateTime        @default(now())
+  sentAt       DateTime?
+
+  trackedUrl TrackedUrl @relation(fields: [trackedUrlId], references: [id], onDelete: Cascade)
+  snapshot   Snapshot   @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@unique([dedupeKey])
+  @@index([state, createdAt])
+}

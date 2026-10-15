@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Website Change Detector</title>
+<style>
+  :root { --ok:#1a9850; --err:#d73027; --warn:#f59e0b; --muted:#6b7280; --line:#e5e7eb; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; color: #111; background: #f9fafb; }
+  header { background: #111827; color: #fff; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; }
+  main { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+  input, select, button, textarea { font: inherit; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; }
+  button { background: #111827; color: #fff; cursor: pointer; border-color: #111827; }
+  button.secondary { background: #fff; color: #111; border-color: #d1d5db; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; color: #fff; }
+  .OK { background: var(--ok); } .ERROR, .NOT_FOUND { background: var(--err); } .BLOCKED { background: var(--warn); }
+  .PENDING, .PAUSED { background: var(--muted); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  #picker { width: 100%; height: 480px; border: 1px solid var(--line); background: #fff; }
+  .chip { background: #eef2ff; border-radius: 4px; padding: 1px 6px; margin-right: 4px; font-family: monospace; font-size: 12px; }
+  .chip.ignore { background: #fee2e2; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header><strong>Website Change Detector</strong><span id="who"></span></header>
+<main>
+  <section id="auth" class="card">
+    <div class="row">
+      <input id="email" type="email" placeholder="email">
+      <input id="password" type="password" placeholder="password (10+ chars)">
+      <button id="login">Log in</button>
+      <button id="register" class="secondary">Register</button>
+      <span id="authError" class="muted"></span>
+    </div>
+  </section>
+
+  <section id="app" class="hidden">
+    <div class="card">
+      <h3 style="margin-top:0">Track a page</h3>
+      <div class="row">
+        <input id="newUrl" placeholder="https://example.com/page" size="40">
+        <input id="newName" placeholder="Name">
+        <select id="newInterval">
+          <option value="15">every 15 min</option><option value="60" selected>every hour</option>
+          <option value="360">every 6 hours</option><option value="1440">every 24 hours</option>
+        </select>
+        <select id="newSens"><option>LOW</option><option selected>MEDIUM</option><option>HIGH</option></select>
+        <button id="pick" class="secondary">Pick regions...</button>
+      </div>
+      <div class="row"><input id="kwAdd" placeholder="Alert when these appear (comma separated)" size="38">
+        <input id="kwRem" placeholder="Alert when these disappear" size="30"></div>
+      <div class="row"><input id="numLabel" placeholder="Track number: label (e.g. Price)">
+        <input id="numSel" placeholder="CSS selector (e.g. .price)"></div>
+      <div id="pickerBox" class="hidden">
+        <div class="row">
+          <label><input type="radio" name="mode" value="watch" checked> Watch this region</label>
+          <label><input type="radio" name="mode" value="ignore"> Ignore this region</label>
+          <span class="muted">Click elements in the preview below.</span>
+        </div>
+        <iframe id="picker" sandbox="allow-scripts"></iframe>
+        <div id="chosen" class="row" style="margin-top:8px"></div>
+      </div>
+      <div class="row"><button id="add">Start tracking</button><span id="addError" class="muted"></span></div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">Tracked pages</h3>
+      <table><thead><tr><th>Page</th><th>Status</th><th>Last checked</th><th>Last changed</th><th>Versions</th><th></th></tr></thead>
+        <tbody id="targets"></tbody></table>
+    </div>
+
+    <div id="detail" class="card hidden">
+      <h3 id="detailTitle" style="margin-top:0"></h3>
+      <div class="muted" id="detailMeta"></div>
+      <h4>Version timeline</h4>
+      <div class="row"><select id="cmpFrom"></select> &rarr; <select id="cmpTo"></select><button id="cmpGo">Compare side by side</button></div>
+      <table><tbody id="timeline"></tbody></table>
+      <h4>Tracked numbers</h4>
+      <canvas id="chart" width="900" height="220" style="max-width:100%"></canvas>
+      <div id="chartLegend" class="muted"></div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let token = localStorage.getItem('wcd_token');
+let watch = [], ignore = [];
+
+// Build DOM with textContent only: page titles and summaries come from untrusted sites.
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'class') el.className = v; else if (k.startsWith('on')) el.addEventListener(k.slice(2), v); else el.setAttribute(k, v);
+  }
+  for (const k of kids.flat()) el.append(k instanceof Node ? k : document.createTextNode(k ?? ''));
+  return el;
+}
+const fmt = (d) => (d ? new Date(d).toLocaleString() : 'never');
+
+async function api(path, opts = {}) {
+  const res = await fetch('/api' + path, { ...opts, headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token, ...(opts.headers || {}) } });
+  if (res.status === 401) { logout(); throw new Error('Please log in'); }
+  const body = res.status === 204 ? null : await res.json();
+  if (!res.ok) throw new Error(body && (body.issues ? body.issues.map((i) => i.path + ': ' + i.message).join('; ') : body.error) || 'Request failed');
+  return body;
+}
+
+function logout() { token = null; localStorage.removeItem('wcd_token'); render(); }
+
+async function authenticate(kind) {
+  try {
+    const r = await fetch('/api/auth/' + kind, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: $('email').value, password: $('password').value }) });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || 'Failed');
+    token = body.token; localStorage.setItem('wcd_token', token); render();
+  } catch (e) { $('authError').textContent = e.message; }
+}
+$('login').onclick = () => authenticate('login');
+$('register').onclick = () => authenticate('register');
+
+async function loadTargets() {
+  const rows = await api('/targets');
+  const tb = $('targets'); tb.replaceChildren();
+  for (const t of rows) {
+    tb.append(h('tr', {},
+      h('td', {}, h('strong', {}, t.name), h('br'), h('a', { href: t.url, target: '_blank', rel: 'noopener noreferrer' }, t.url),
+        t.volatile ? h('div', { class: 'muted' }, 'Noisy page: instant alerts paused') : ''),
+      h('td', {}, h('span', { class: 'badge ' + t.status }, t.status), t.statusDetail ? h('div', { class: 'muted' }, t.statusDetail) : ''),
+      h('td', {}, fmt(t.lastCheckedAt)), h('td', {}, fmt(t.lastChangedAt)), h('td', {}, String(t.versions ?? 0)),
+      h('td', {}, h('button', { class: 'secondary', onclick: () => openDetail(t) }, 'Timeline'), ' ',
+        h('button', { class: 'secondary', onclick: async () => { await api('/targets/' + t.id, { method: 'DELETE' }); loadTargets(); } }, 'Delete'))));
+  }
+}
+
+async function openDetail(t) {
+  $('detail').classList.remove('hidden');
+  $('detailTitle').textContent = t.name;
+  $('detailMeta').replaceChildren('RSS feed: ', h('a', { href: t.feedUrl }, t.feedUrl));
+  const versions = await api('/targets/' + t.id + '/versions');
+  for (const sel of [$('cmpFrom'), $('cmpTo')]) { sel.replaceChildren(...versions.map((v) => h('option', { value: v.version }, 'v' + v.version + ' - ' + fmt(v.createdAt)))); }
+  if (versions.length > 1) { $('cmpFrom').value = versions[1].version; $('cmpTo').value = versions[0].version; }
+  $('cmpGo').onclick = async () => {
+    const r = await api('/targets/' + t.id + '/compare?from=' + $('cmpFrom').value + '&to=' + $('cmpTo').value);
+    window.open(r.viewUrl, '_blank', 'noopener');
+  };
+  $('timeline').replaceChildren(...versions.map((v) => h('tr', {},
+    h('td', {}, 'v' + v.version), h('td', {}, fmt(v.createdAt)),
+    h('td', {}, v.summary || (v.stats ? '+' + v.stats.added + ' / -' + v.stats.removed + ' lines' : 'Baseline')),
+    h('td', {}, v.diffUrl ? h('a', { href: v.diffUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Diff') : ''))));
+  drawChart(await api('/targets/' + t.id + '/numbers'));
+}
+
+function drawChart(series) {
+  const c = $('chart'), g = c.getContext('2d'); g.clearRect(0, 0, c.width, c.height);
+  const names = Object.keys(series); $('chartLegend').textContent = names.length ? names.join(' | ') : 'No number tracking configured.';
+  const pts = names.flatMap((n) => series[n]); if (!pts.length) return;
+  const xs = pts.map((p) => +new Date(p.t)), ys = pts.map((p) => p.v);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs) || 1, y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const px = (x) => 40 + ((x - x0) / (x1 - x0 || 1)) * (c.width - 60), py = (y) => c.height - 25 - ((y - y0) / (y1 - y0 || 1)) * (c.height - 50);
+  const colors = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#ea580c'];
+  g.fillStyle = '#6b7280'; g.fillText(String(y1), 2, 20); g.fillText(String(y0), 2, c.height - 25);
+  names.forEach((n, i) => {
+    g.strokeStyle = colors[i % colors.length]; g.lineWidth = 2; g.beginPath();
+    series[n].forEach((p, j) => { const X = px(+new Date(p.t)), Y = py(p.v); j ? g.lineTo(X, Y) : g.moveTo(X, Y); }); g.stroke();
+  });
+}
+
+/* ---- region picker ---- */
+function renderChosen() {
+  $('chosen').replaceChildren(...watch.map((s) => h('span', { class: 'chip' }, 'watch: ' + s)), ...ignore.map((s) => h('span', { class: 'chip ignore' }, 'ignore: ' + s)));
+}
+$('pick').onclick = async () => {
+  $('addError').textContent = 'Loading preview...';
+  try {
+    const { html } = await api('/picker/prepare', { method: 'POST', body: JSON.stringify({ url: $('newUrl').value }) });
+    $('picker').srcdoc = html; $('pickerBox').classList.remove('hidden'); $('addError').textContent = '';
+  } catch (e) { $('addError').textContent = e.message; }
+};
+document.querySelectorAll('input[name=mode]').forEach((r) => r.onchange = () => $('picker').contentWindow.postMessage({ type: 'mode', mode: r.value }, '*'));
+window.addEventListener('message', (e) => {
+  if (e.source !== $('picker').contentWindow || !e.data || e.data.type !== 'wcd-selected') return;
+  const list = e.data.mode === 'ignore' ? ignore : watch;
+  if (typeof e.data.selector === 'string' && !list.includes(e.data.selector)) list.push(e.data.selector);
+  renderChosen();
+});
+
+$('add').onclick = async () => {
+  const list = (s) => s.split(',').map((x) => x.trim()).filter(Boolean);
+  const body = { url: $('newUrl').value, name: $('newName').value || new URL($('newUrl').value).hostname,
+    intervalMinutes: +$('newInterval').value, sensitivity: $('newSens').value, watchSelectors: watch, ignoreSelectors: ignore,
+    keywordsAdded: list($('kwAdd').value), keywordsRemoved: list($('kwRem').value),
+    numberRules: $('numLabel').value && $('numSel').value ? [{ label: $('numLabel').value, selector: $('numSel').value }] : [] };
+  try { await api('/targets', { method: 'POST', body: JSON.stringify(body) }); $('addError').textContent = ''; watch = []; ignore = []; renderChosen(); loadTargets(); }
+  catch (e) { $('addError').textContent = e.message; }
+};
+
+function render() {
+  const authed = !!token;
+  $('auth').classList.toggle('hidden', authed); $('app').classList.toggle('hidden', !authed);
+  $('who').replaceChildren(authed ? h('button', { class: 'secondary', onclick: logout }, 'Log out') : '');
+  if (authed) loadTargets().catch(() => {});
+}
+render();
+setInterval(() => token && loadTargets().catch(() => {}), 60000);
+</script>
+</body>
+</html>

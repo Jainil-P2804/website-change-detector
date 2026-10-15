@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: 320px; font: 13px system-ui, sans-serif; margin: 12px; }
+  input, select, button { width: 100%; box-sizing: border-box; margin: 4px 0; padding: 6px; font: inherit; }
+  button { background: #111827; color: #fff; border: 0; border-radius: 6px; cursor: pointer; }
+  #msg { margin-top: 6px; color: #374151; }
+  details { margin-top: 8px; }
+</style>
+</head>
+<body>
+  <strong>Track this page</strong>
+  <input id="name" placeholder="Name">
+  <select id="interval">
+    <option value="15">Every 15 minutes</option><option value="60" selected>Every hour</option>
+    <option value="360">Every 6 hours</option><option value="1440">Every 24 hours</option>
+  </select>
+  <button id="go">Start tracking</button>
+  <div id="msg"></div>
+  <details><summary>Connection</summary>
+    <input id="server" placeholder="Server URL, e.g. https://wcd.example.com">
+    <input id="token" type="password" placeholder="API token (from dashboard settings)">
+    <button id="save">Save</button>
+  </details>
+  <script src="popup.js"></script>
+</body>
+</html>

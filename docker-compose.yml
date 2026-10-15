@@ -1,0 +1,80 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: wcd
+      POSTGRES_PASSWORD: wcd
+      POSTGRES_DB: wcd
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wcd"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build: .
+    # First run: creates tables straight from schema.prisma.
+    # For production, generate and commit migrations (`npm run db:dev -- --name init`)
+    # and switch this command to: ["npx", "prisma", "migrate", "deploy"]
+    command: ["npx", "prisma", "db", "push", "--skip-generate"]
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: ["node", "src/api/server.js"]
+    env_file: .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - artifacts:/data/artifacts
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  scheduler:
+    build: .
+    command: ["node", "src/queue/scheduler.js"]
+    env_file: .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["node", "src/worker/index.js"]
+    env_file: .env
+    shm_size: "1gb"          # Chromium needs more than the 64MB default /dev/shm
+    volumes:
+      - artifacts:/data/artifacts
+    deploy:
+      replicas: 2            # scale with: docker compose up -d --scale worker=4
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  artifacts:
